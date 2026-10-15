@@ -22,8 +22,8 @@ export function LoginCard({ onSignedIn }: LoginCardProps) {
 
   const signIn = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    const normalizedEmail = email.trim();
     console.log("[AdminLogin] Sign in submitted", {
-      email,
       hasPassword: password.length > 0,
       supabaseConfigError,
     });
@@ -43,7 +43,10 @@ export function LoginCard({ onSignedIn }: LoginCardProps) {
 
     try {
       const { data, error: signInError } =
-        await supabase.auth.signInWithPassword({ email, password });
+        await supabase.auth.signInWithPassword({
+          email: normalizedEmail,
+          password,
+        });
       const signInErrorDetails = signInError
         ? {
             name: signInError.name,
@@ -96,15 +99,16 @@ export function LoginCard({ onSignedIn }: LoginCardProps) {
   const sendPasswordReset = async () => {
     setError(null);
     setNotice(null);
+    const normalizedEmail = email.trim();
 
-    if (!email) {
+    if (!normalizedEmail) {
       setError("Enter your admin email first, then click Change password.");
       return;
     }
 
     setResetLoading(true);
     const { error: resetError } = await supabase.auth.resetPasswordForEmail(
-      email,
+      normalizedEmail,
       {
         redirectTo:
           typeof window === "undefined" ? undefined : window.location.origin,
@@ -143,6 +147,7 @@ export function LoginCard({ onSignedIn }: LoginCardProps) {
             <input
               className="mt-2 h-11 w-full rounded-lg border border-zinc-200 px-3 font-normal outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-100"
               type="email"
+              autoComplete="email"
               value={email}
               onChange={(event) => setEmail(event.target.value)}
               required
@@ -154,6 +159,7 @@ export function LoginCard({ onSignedIn }: LoginCardProps) {
               <input
                 className="h-11 w-full rounded-lg border border-zinc-200 px-3 pr-11 font-normal outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-100"
                 type={passwordVisible ? "text" : "password"}
+                autoComplete="current-password"
                 value={password}
                 onChange={(event) => setPassword(event.target.value)}
                 required

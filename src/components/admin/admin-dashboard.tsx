@@ -74,6 +74,7 @@ type UserRow = {
   role?: string | null;
   approvalStatus?: string | null;
   requestedRole?: string | null;
+  wardNumber?: string | null;
   wardName?: string | null;
   ward_id?: string | null;
   location?: string | null;
@@ -119,8 +120,67 @@ type AuditRow = {
   actor_email?: string | null;
   record_label?: string | null;
   change_details?: unknown;
+  changed_fields?: string[] | null;
+  privacy_version?: number | null;
   created_at?: string | null;
 };
+
+const auditResourceLabels: Record<string, string> = {
+  users: "user",
+  reports: "community report",
+  emergencies: "emergency",
+  emergency_requests: "emergency request",
+  cps_duty_sessions: "CPS duty session",
+  saved_contacts: "saved contact",
+  wards: "ward",
+};
+
+const humanizeAuditField = (field: string) =>
+  field
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+
+const getAuditFields = (log: AuditRow) => {
+  if (Array.isArray(log.changed_fields)) return log.changed_fields;
+  if (Array.isArray(log.change_details)) {
+    return log.change_details.flatMap((entry) =>
+      entry && typeof entry === "object" && "field" in entry && typeof entry.field === "string"
+        ? [entry.field]
+        : [],
+    );
+  }
+  return [];
+};
+
+const getAuditResource = (log: AuditRow) => {
+  const table = log.table_name?.split(".").pop()?.replaceAll('"', "") || "record";
+  return auditResourceLabels[table.toLowerCase()] || humanizeAuditField(table);
+};
+
+const getAuditAction = (operation?: string | null) => {
+  switch (operation?.toUpperCase()) {
+    case "INSERT": return "Created";
+    case "UPDATE": return "Updated";
+    case "DELETE": return "Deleted";
+    default: return "Changed";
+  }
+};
+
+const getAuditSummary = (log: AuditRow) => {
+  if (log.privacy_version && log.privacy_version > 0) {
+    return `${getAuditAction(log.operation)} ${getAuditResource(log)}`;
+  }
+  return log.action_summary || `${getAuditAction(log.operation)} ${getAuditResource(log)}`;
+};
+
+const getAuditActor = (log: AuditRow) => {
+  const actor = log.actor_display_name || log.actor_email;
+  return actor?.startsWith("hmac-sha256:") ? "Protected actor" : actor || "Unknown actor";
+};
+
+const getAuditRecordLabel = (log: AuditRow) =>
+  log.record_label?.startsWith("hmac-sha256:") ? "Protected record" : log.record_label;
 
 const navItems = [
   { id: "overview", label: "Overview", icon: Grid2X2 },
@@ -185,6 +245,7 @@ export function AdminDashboard() {
   const [activeSection, setActiveSection] = useState<AdminSection>("overview");
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [accessDenied, setAccessDenied] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
@@ -210,6 +271,7 @@ export function AdminDashboard() {
   const loadDashboard = useCallback(async () => {
     console.log("[AdminDashboard] Loading dashboard data");
     setLoading(true);
+    setAccessDenied(false);
     setError(null);
     const { data: sessionData } = await supabase.auth.getSession();
     const user = sessionData.session?.user ?? null;
@@ -221,6 +283,10 @@ export function AdminDashboard() {
     setSessionUser(user);
     if (!user) {
       console.log("[AdminDashboard] No active session, showing login");
+      setUsers([]);
+      setReports([]);
+      setEmergencies([]);
+      setAuditLogs([]);
       setLoading(false);
       return;
     }
@@ -235,31 +301,36 @@ export function AdminDashboard() {
       error: profileError?.message,
     });
     if (profileError) {
-      console.warn(
-        "[AdminDashboard] Could not load signed-in user's profile. Continuing with table fetches.",
-        {
-          message: profileError.message,
-          code: profileError.code,
-        },
-      );
+      console.error("[AdminDashboard] Could not verify admin profile", {
+        message: profileError.message,
+        code: profileError.code,
+      });
+      setError("Could not verify your admin access. Please sign in again.");
+      setAccessDenied(true);
+      setLoading(false);
+      return;
     }
     if (profile?.role !== "admin" || profile?.approvalStatus !== "approved") {
       console.warn("[AdminDashboard] Signed-in user is not an approved admin", {
         role: profile?.role,
         approvalStatus: profile?.approvalStatus,
       });
+      setAccessDenied(true);
+      setLoading(false);
+      return;
     }
 
     console.log("[AdminDashboard] Fetching dashboard tables", {
       role: profile?.role,
       approvalStatus: profile?.approvalStatus,
     });
-    const [usersResult, reportsResult, emergencyResult, auditResult] =
+    const [usersResult, wardsResult, reportsResult, emergencyResult, auditResult] =
       await Promise.all([
         supabase
           .from("users")
           .select("*")
           .order("createdAt", { ascending: false }),
+        supabase.from("wards").select("id, ward_number"),
         supabase
           .from("reports")
           .select("*")
@@ -277,6 +348,7 @@ export function AdminDashboard() {
 
     const tableErrors = [
       usersResult.error ? `users: ${usersResult.error.message}` : null,
+      wardsResult.error ? `wards: ${wardsResult.error.message}` : null,
       reportsResult.error ? `reports: ${reportsResult.error.message}` : null,
       emergencyResult.error
         ? `emergencyRequests: ${emergencyResult.error.message}`
@@ -297,7 +369,17 @@ export function AdminDashboard() {
       );
       setError(tableErrors.join(" | "));
     }
-    setUsers((usersResult.data || []) as UserRow[]);
+    const wardNumbersById = new Map(
+      (wardsResult.data || []).map((ward) => [ward.id, ward.ward_number]),
+    );
+    setUsers(
+      ((usersResult.data || []) as UserRow[]).map((user) => ({
+        ...user,
+        wardNumber: user.ward_id
+          ? wardNumbersById.get(user.ward_id) || null
+          : null,
+      })),
+    );
     setReports((reportsResult.data || []) as ReportRow[]);
     setEmergencies((emergencyResult.data || []) as EmergencyRow[]);
     setAuditLogs((auditResult.data || []) as AuditRow[]);
@@ -448,8 +530,9 @@ export function AdminDashboard() {
     );
   });
   const filteredAuditLogs = auditLogs.filter((log) => {
+    const fields = getAuditFields(log).map(humanizeAuditField).join(" ");
     const haystack =
-      `${log.action_summary || ""} ${log.operation || ""} ${log.table_name || ""} ${log.actor_display_name || ""} ${log.actor_email || ""} ${log.record_label || ""}`.toLowerCase();
+      `${getAuditSummary(log)} ${log.operation || ""} ${getAuditResource(log)} ${getAuditActor(log)} ${getAuditRecordLabel(log) || ""} ${fields}`.toLowerCase();
     return (
       haystack.includes(query.toLowerCase()) &&
       (statusFilter === "all" ||
@@ -499,6 +582,7 @@ export function AdminDashboard() {
     !!sessionUser && daysSince(passwordUpdatedAt) >= 90;
 
   const updateUserRole = async (user: UserRow, role: string) => {
+    if (user.approvalStatus === "blocked") return;
     if (
       !window.confirm(`Change ${getName(user)} to ${roleLabels[role] || role}?`)
     )
@@ -516,10 +600,97 @@ export function AdminDashboard() {
     }
     await loadDashboard();
   };
-  const unavailableAdminAction = (action: string) => {
-    setNotice(
-      `${action} requires a secure server-side admin endpoint and schema support. It was not run from browser code.`,
-    );
+  const blockUser = async (user: UserRow) => {
+    if (user.role === "admin" || user.approvalStatus === "blocked") return;
+    if (
+      !window.confirm(
+        `Block ${getName(user)}? They will no longer be able to sign in.`,
+      )
+    ) {
+      return;
+    }
+
+    setUpdatingId(user.id);
+    setError(null);
+    setNotice(null);
+    try {
+      const { data, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError || !data.session?.access_token) {
+        throw new Error("Your admin session has expired. Sign in again.");
+      }
+
+      const response = await fetch("/api/admin/users/block", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${data.session.access_token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ userId: user.id }),
+      });
+      const result = (await response.json().catch(() => ({}))) as {
+        error?: string;
+      };
+      if (!response.ok) {
+        throw new Error(result.error || "Could not block this user.");
+      }
+
+      setNotice(`${getName(user)} has been blocked from signing in.`);
+      await loadDashboard();
+    } catch (blockError) {
+      setError(
+        blockError instanceof Error
+          ? blockError.message
+          : "Could not block this user.",
+      );
+    } finally {
+      setUpdatingId(null);
+    }
+  };
+  const deleteUser = async (user: UserRow) => {
+    if (user.role === "admin" || user.id === sessionUserId) return;
+    if (
+      !window.confirm(
+        `Permanently delete ${getName(user)}? Their sign-in, profile, emergency contacts, and saved pinpoints will be removed. Historical reports and emergency records will be retained with identifying account details anonymized. Existing access tokens may remain valid until they expire. Use Block to prevent sign-in without deleting the account.`,
+      )
+    ) {
+      return;
+    }
+
+    setUpdatingId(user.id);
+    setError(null);
+    setNotice(null);
+    try {
+      const { data, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError || !data.session?.access_token) {
+        throw new Error("Your admin session has expired. Sign in again.");
+      }
+
+      const response = await fetch("/api/admin/users/delete", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${data.session.access_token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ userId: user.id }),
+      });
+      const result = (await response.json().catch(() => ({}))) as {
+        error?: string;
+      };
+      if (!response.ok) {
+        throw new Error(result.error || "Could not delete this user.");
+      }
+
+      setNotice(`${getName(user)} was permanently deleted.`);
+      await loadDashboard();
+    } catch (deleteError) {
+      setError(
+        deleteError instanceof Error
+          ? deleteError.message
+          : "Could not delete this user.",
+      );
+    } finally {
+      setUpdatingId(null);
+    }
   };
   const updateEmergencyStatus = async (row: EmergencyRow, status: string) => {
     if (row.status === status) return;
@@ -606,6 +777,26 @@ export function AdminDashboard() {
       </main>
     );
   }
+  if (accessDenied) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-zinc-100 px-4 py-8">
+        <section className="w-full max-w-lg rounded-lg border border-zinc-200 bg-white p-6 shadow-sm">
+          <h1 className="text-xl font-black text-zinc-950">Admin access required</h1>
+          <p className="mt-2 text-sm text-zinc-600">
+            {error ||
+              "This account does not have an approved admin profile. Ask the project owner to grant admin access."}
+          </p>
+          <Button
+            className="mt-5"
+            variant="outline"
+            onClick={() => supabase.auth.signOut()}
+          >
+            Sign out
+          </Button>
+        </section>
+      </main>
+    );
+  }
   const renderSection = () => {
     if (activeSection === "users") {
       return (
@@ -628,13 +819,13 @@ export function AdminDashboard() {
         >
           <div className="mb-4 grid gap-3 md:grid-cols-4">
             <input
-              className="h-10 rounded-lg border border-zinc-200 px-3 text-sm outline-none focus:border-blue-500"
+              className="h-10 w-full min-w-0 rounded-lg border border-zinc-200 px-3 text-sm outline-none focus:border-blue-500"
               placeholder="Search users"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
             />
             <select
-              className="h-10 rounded-lg border border-zinc-200 px-3 text-sm"
+              className="h-10 w-full min-w-0 rounded-lg border border-zinc-200 px-3 text-sm"
               value={roleFilter}
               onChange={(event) => setRoleFilter(event.target.value)}
             >
@@ -646,7 +837,7 @@ export function AdminDashboard() {
               ))}
             </select>
             <select
-              className="h-10 rounded-lg border border-zinc-200 px-3 text-sm"
+              className="h-10 w-full min-w-0 rounded-lg border border-zinc-200 px-3 text-sm"
               value={statusFilter}
               onChange={(event) => setStatusFilter(event.target.value)}
             >
@@ -658,7 +849,7 @@ export function AdminDashboard() {
               ))}
             </select>
             <select
-              className="h-10 rounded-lg border border-zinc-200 px-3 text-sm"
+              className="h-10 w-full min-w-0 rounded-lg border border-zinc-200 px-3 text-sm"
               value={locationFilter}
               onChange={(event) => setLocationFilter(event.target.value)}
             >
@@ -670,7 +861,7 @@ export function AdminDashboard() {
               ))}
             </select>
           </div>
-          <div className="overflow-hidden rounded-lg border border-zinc-200">
+          <div className="overflow-x-auto rounded-lg border border-zinc-200">
             <table className="w-full min-w-[820px] text-left text-sm">
               <thead className="bg-zinc-50 text-xs uppercase text-zinc-500">
                 <tr>
@@ -695,7 +886,9 @@ export function AdminDashboard() {
                       {roleLabels[user.role || ""] || user.role || "Unknown"}
                     </td>
                     <td className="px-4 py-3 text-zinc-700">
-                      {user.wardName || "Not assigned"}
+                      {user.wardNumber
+                        ? `Ward ${user.wardNumber}`
+                        : user.wardName || "Not assigned"}
                     </td>
                     <td className="px-4 py-3">
                       <Badge value={user.approvalStatus} />
@@ -715,29 +908,54 @@ export function AdminDashboard() {
                             key={role}
                             variant={user.role === role ? "default" : "outline"}
                             size="xs"
-                            disabled={updatingId === user.id}
+                            disabled={
+                              updatingId === user.id ||
+                              user.approvalStatus === "blocked"
+                            }
                             onClick={() => updateUserRole(user, role)}
                           >
                             {roleLabels[role]}
                           </Button>
                         ))}
                         <Button
-                          variant="outline"
+                          variant={
+                            user.approvalStatus === "blocked"
+                              ? "outline"
+                              : "destructive"
+                          }
                           size="xs"
-                          onClick={() =>
-                            unavailableAdminAction("Blocking users")
+                          disabled={
+                            updatingId === user.id ||
+                            user.approvalStatus === "blocked" ||
+                            user.role === "admin"
+                          }
+                          onClick={() => blockUser(user)}
+                          title={
+                            user.role === "admin"
+                              ? "Admin accounts cannot be blocked here"
+                              : undefined
                           }
                         >
-                          Block
+                          {user.approvalStatus === "blocked" ? "Blocked" : "Block"}
                         </Button>
                         <Button
                           variant="destructive"
                           size="xs"
-                          onClick={() =>
-                            unavailableAdminAction("Deleting users")
+                          disabled={
+                            updatingId === user.id ||
+                            user.role === "admin" ||
+                            user.id === sessionUserId
+                          }
+                          onClick={() => deleteUser(user)}
+                          title={
+                            user.role === "admin"
+                              ? "Admin accounts cannot be deleted here"
+                              : user.id === sessionUserId
+                                ? "You cannot delete your own admin account"
+                                : undefined
                           }
                         >
-                          Delete
+                          {updatingId === user.id ? "Deleting..." : "Delete"}
                         </Button>
                       </div>
                     </td>
@@ -784,13 +1002,13 @@ export function AdminDashboard() {
         >
           <div className="mb-4 grid gap-3 md:grid-cols-4">
             <input
-              className="h-10 rounded-lg border border-zinc-200 px-3 text-sm outline-none focus:border-blue-500"
+              className="h-10 w-full min-w-0 rounded-lg border border-zinc-200 px-3 text-sm outline-none focus:border-blue-500"
               placeholder="Search emergencies"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
             />
             <select
-              className="h-10 rounded-lg border border-zinc-200 px-3 text-sm"
+              className="h-10 w-full min-w-0 rounded-lg border border-zinc-200 px-3 text-sm"
               value={statusFilter}
               onChange={(event) => setStatusFilter(event.target.value)}
             >
@@ -802,7 +1020,7 @@ export function AdminDashboard() {
               ))}
             </select>
             <select
-              className="h-10 rounded-lg border border-zinc-200 px-3 text-sm"
+              className="h-10 w-full min-w-0 rounded-lg border border-zinc-200 px-3 text-sm"
               value={emergencyTypeFilter}
               onChange={(event) => setEmergencyTypeFilter(event.target.value)}
             >
@@ -814,7 +1032,7 @@ export function AdminDashboard() {
               ))}
             </select>
             <select
-              className="h-10 rounded-lg border border-zinc-200 px-3 text-sm"
+              className="h-10 w-full min-w-0 rounded-lg border border-zinc-200 px-3 text-sm"
               value={locationFilter}
               onChange={(event) => setLocationFilter(event.target.value)}
             >
@@ -854,7 +1072,7 @@ export function AdminDashboard() {
                   </div>
                   <Badge value={row.status} />
                 </div>
-                <div className="mt-3 flex gap-2">
+                <div className="mt-3 flex flex-wrap gap-2">
                   <Button
                     variant="outline"
                     size="sm"
@@ -915,13 +1133,13 @@ export function AdminDashboard() {
         >
           <div className="mb-4 grid gap-3 md:grid-cols-4">
             <input
-              className="h-10 rounded-lg border border-zinc-200 px-3 text-sm outline-none focus:border-blue-500"
+              className="h-10 w-full min-w-0 rounded-lg border border-zinc-200 px-3 text-sm outline-none focus:border-blue-500"
               placeholder="Search reports"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
             />
             <select
-              className="h-10 rounded-lg border border-zinc-200 px-3 text-sm"
+              className="h-10 w-full min-w-0 rounded-lg border border-zinc-200 px-3 text-sm"
               value={statusFilter}
               onChange={(event) => setStatusFilter(event.target.value)}
             >
@@ -933,7 +1151,7 @@ export function AdminDashboard() {
               ))}
             </select>
             <select
-              className="h-10 rounded-lg border border-zinc-200 px-3 text-sm"
+              className="h-10 w-full min-w-0 rounded-lg border border-zinc-200 px-3 text-sm"
               value={reportTypeFilter}
               onChange={(event) => setReportTypeFilter(event.target.value)}
             >
@@ -985,7 +1203,7 @@ export function AdminDashboard() {
                   </div>
                   <Badge value={row.status} />
                 </div>
-                <div className="mt-3 flex gap-2">
+                <div className="mt-3 flex flex-wrap gap-2">
                   <Button
                     variant="outline"
                     size="sm"
@@ -1086,22 +1304,19 @@ export function AdminDashboard() {
                   <ReceiptText className="size-5" />
                 </div>
                 <div className="min-w-0 flex-1">
-                  <p className="font-bold text-zinc-950">
-                    {log.action_summary ||
-                      `${log.operation || "Change"} on ${log.table_name || "record"}`}
-                  </p>
+                  <p className="font-bold text-zinc-950">{getAuditSummary(log)}</p>
                   <p className="text-sm text-zinc-500">
-                    {log.actor_display_name ||
-                      log.actor_email ||
-                      "Unknown actor"}{" "}
-                    · {formatDate(log.created_at)}
+                    {getAuditActor(log)} · {formatDate(log.created_at)}
                   </p>
-                  {log.record_label ? (
-                    <p className="mt-1 text-sm text-zinc-700">
-                      {log.record_label}
-                    </p>
+                  {getAuditRecordLabel(log) ? (
+                    <p className="mt-1 text-sm text-zinc-700">{getAuditRecordLabel(log)}</p>
                   ) : null}
-                </div>
+                  {getAuditFields(log).length > 0 ? (
+                    <p className="mt-1 text-xs text-zinc-500">
+                      Changed: {getAuditFields(log).slice(0, 4).map(humanizeAuditField).join(", ")}
+                      {getAuditFields(log).length > 4 ? ` +${getAuditFields(log).length - 4} more` : ""}
+                    </p>
+                  ) : null}</div>
               </div>
             ))}
           </div>
@@ -1458,7 +1673,7 @@ export function AdminDashboard() {
       <div className="flex min-h-screen">
         <aside
           className={cn(
-            "fixed inset-y-0 left-0 z-40 w-72 border-r border-zinc-200 bg-white transition lg:static lg:translate-x-0",
+            "fixed inset-y-0 left-0 z-40 w-72 shrink-0 border-r border-zinc-200 bg-white transition lg:static lg:translate-x-0",
             mobileMenuOpen ? "translate-x-0" : "-translate-x-full",
           )}
         >
@@ -1513,7 +1728,7 @@ export function AdminDashboard() {
         ) : null}
         <main className="min-w-0 flex-1">
           <header className="sticky top-0 z-20 border-b border-zinc-200 bg-white/95 backdrop-blur">
-            <div className="flex min-h-16 items-center gap-3 px-4 lg:px-6">
+            <div className="flex min-h-16 items-center gap-2 px-3 sm:gap-3 sm:px-4 lg:px-6">
               <Button
                 variant="ghost"
                 size="icon-sm"
@@ -1527,7 +1742,7 @@ export function AdminDashboard() {
                 <p className="text-xs font-bold uppercase text-zinc-500">
                   {selectedNav.label}
                 </p>
-                <h1 className="truncate text-xl font-black text-zinc-950">
+                <h1 className="truncate text-base font-black text-zinc-950 sm:text-xl">
                   Community operations dashboard
                 </h1>
               </div>
@@ -1547,18 +1762,18 @@ export function AdminDashboard() {
                 size="sm"
                 onClick={() => supabase.auth.signOut()}
               >
-                Sign out <ChevronDown />
+                <span className="hidden sm:inline">Sign out</span> <ChevronDown />
               </Button>
             </div>
           </header>
-          <section className="px-4 py-5 lg:px-6">
+          <section className="mx-auto w-full max-w-screen-2xl px-3 py-4 sm:px-4 sm:py-5 lg:px-6">
             <div className="mb-5 grid gap-3 rounded-lg border border-zinc-200 bg-white p-4 shadow-sm md:grid-cols-[1fr_auto] md:items-center">
               <div>
                 <h2 className="text-2xl font-black text-zinc-950">
                   Admin Dashboard
                 </h2>
               </div>
-              <div className="flex flex-wrap gap-2">
+              <div className="flex flex-wrap gap-2 md:justify-end">
                 <Button variant="outline" onClick={loadDashboard}>
                   <Activity /> Refresh
                 </Button>
@@ -1700,7 +1915,7 @@ export function AdminDashboard() {
             ) : null}
             {selectedAuditLog ? (
               <Panel
-                title={`Audit Log Details · ${selectedAuditLog.id}`}
+                title="Audit Log Details"
                 action={
                   <Button
                     variant="ghost"
@@ -1711,9 +1926,32 @@ export function AdminDashboard() {
                   </Button>
                 }
               >
-                <pre className="max-h-80 overflow-auto rounded-lg bg-zinc-950 p-4 text-xs text-zinc-50">
-                  {JSON.stringify(selectedAuditLog, null, 2)}
-                </pre>
+                <div className="space-y-4">
+                  <p className="text-sm text-zinc-600">
+                    Personal values are protected in audit history. The event, resource, time, and changed field names remain available here.
+                  </p>
+                  <div className="grid gap-3 rounded-lg border border-zinc-200 p-4 sm:grid-cols-2">
+                    <p><strong>Action:</strong> {getAuditAction(selectedAuditLog.operation)}</p>
+                    <p><strong>Resource:</strong> {getAuditResource(selectedAuditLog)}</p>
+                    <p><strong>Actor:</strong> {getAuditActor(selectedAuditLog)}</p>
+                    <p><strong>When:</strong> {formatDate(selectedAuditLog.created_at)}</p>
+                    <p className="sm:col-span-2"><strong>Record:</strong> {getAuditRecordLabel(selectedAuditLog) || "Not available"}</p>
+                  </div>
+                  <div>
+                    <h3 className="mb-2 text-sm font-semibold text-zinc-900">Changed fields</h3>
+                    {getAuditFields(selectedAuditLog).length ? (
+                      <ul className="grid gap-2 sm:grid-cols-2">
+                        {getAuditFields(selectedAuditLog).map((field) => (
+                          <li key={field} className="rounded-md bg-zinc-50 px-3 py-2 text-sm text-zinc-700">
+                            {humanizeAuditField(field)}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="text-sm text-zinc-500">No field-level details are available for this event.</p>
+                    )}
+                  </div>
+                </div>
               </Panel>
             ) : null}
           </section>
