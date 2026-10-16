@@ -117,9 +117,12 @@ type AuditRow = {
   table_name?: string | null;
   record_id?: string | null;
   actor_display_name?: string | null;
+  actor_id?: string | null;
   actor_email?: string | null;
   record_label?: string | null;
   change_details?: unknown;
+  old_record?: unknown;
+  new_record?: unknown;
   changed_fields?: string[] | null;
   privacy_version?: number | null;
   created_at?: string | null;
@@ -174,13 +177,106 @@ const getAuditSummary = (log: AuditRow) => {
   return log.action_summary || `${getAuditAction(log.operation)} ${getAuditResource(log)}`;
 };
 
-const getAuditActor = (log: AuditRow) => {
-  const actor = log.actor_display_name || log.actor_email;
-  return actor?.startsWith("hmac-sha256:") ? "Protected actor" : actor || "Unknown actor";
+const getAuditActor = (log: AuditRow, users: UserRow[]) => {
+  const actor = users.find((user) => user.id === log.actor_id);
+  if (actor) return getName(actor);
+  return log.actor_display_name?.startsWith("hmac-sha256:")
+    ? "Actor profile unavailable"
+    : log.actor_display_name || "Unknown actor";
 };
 
-const getAuditRecordLabel = (log: AuditRow) =>
-  log.record_label?.startsWith("hmac-sha256:") ? "Protected record" : log.record_label;
+const getAuditActorEmail = (log: AuditRow, users: UserRow[]) => {
+  const actor = users.find((user) => user.id === log.actor_id);
+  if (actor?.email) return actor.email;
+  return log.actor_email?.startsWith("hmac-sha256:")
+    ? "Email unavailable in historical log"
+    : log.actor_email || "Not recorded";
+};
+
+const getAuditRecordLabel = (
+  log: AuditRow,
+  records: { users: UserRow[]; reports: ReportRow[]; emergencies: EmergencyRow[] },
+) => {
+  const label = log.record_label;
+  if (label && !label.startsWith("hmac-sha256:")) return label;
+  const id = log.record_id;
+  if (!id) return "Record details unavailable";
+  const table = log.table_name?.toLowerCase();
+  if (table === "users") {
+    const user = records.users.find((row) => row.id === id);
+    if (user) return getName(user);
+  }
+  if (table === "reports") {
+    const report = records.reports.find((row) => row.id === id);
+    if (report) return report.reportType || report.crimeCategory || "Community report";
+  }
+  if (table === "emergencyrequests" || table === "emergency_requests") {
+    const emergency = records.emergencies.find((row) => row.id === id);
+    if (emergency) return emergency.emergencyType || emergency.userName || "Emergency request";
+  }
+  return "Historical record label unavailable";
+};
+
+const formatAuditValue = (value: unknown): string => {
+  if (value === null) return "null";
+  if (value === undefined) return "Not recorded";
+  if (typeof value === "string" && value.startsWith("hmac-sha256:")) {
+    return "Protected in historical log; original value unavailable";
+  }
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    const readable = (item: unknown): unknown => {
+      if (typeof item === "string" && item.startsWith("hmac-sha256:")) {
+        return "Protected in historical log; original value unavailable";
+      }
+      if (Array.isArray(item)) return item.map(readable);
+      if (item && typeof item === "object") {
+        return Object.fromEntries(Object.entries(item).map(([key, entry]) => [key, readable(entry)]));
+      }
+      return item;
+    };
+    return JSON.stringify(readable(value), null, 2);
+  } catch {
+    return String(value);
+  }
+};
+
+const getAuditChanges = (log: AuditRow): Record<string, unknown>[] => {
+  if (Array.isArray(log.change_details)) {
+    return log.change_details.filter(
+      (entry): entry is Record<string, unknown> => !!entry && typeof entry === "object",
+    );
+  }
+  if (log.change_details && typeof log.change_details === "object") {
+    const details = log.change_details as Record<string, unknown>;
+    if (Array.isArray(details.changes)) {
+      return details.changes.filter(
+        (entry): entry is Record<string, unknown> => !!entry && typeof entry === "object",
+      );
+    }
+    return Object.entries(details).map(([field, value]) =>
+      value && typeof value === "object" && !Array.isArray(value)
+        ? { field, ...(value as Record<string, unknown>) }
+        : { field, new: value },
+    );
+  }
+  return [];
+};
+
+const getAuditChangeValues = (change: Record<string, unknown>, key: "old" | "new") => {
+  const aliases = key === "old" ? ["old", "old_value", "oldValue", "before"] : ["new", "new_value", "newValue", "after"];
+  const alias = aliases.find((name) => name in change);
+  if (alias) return change[alias];
+  const excluded = new Set(["field", "column", "name", "key", "type"]);
+  const values = Object.fromEntries(Object.entries(change).filter(([name]) => !excluded.has(name)));
+  return Object.keys(values).length ? values : undefined;
+};
+
+const getAuditChangeField = (change: Record<string, unknown>, index: number) => {
+  const field = change.field || change.column || change.name || change.key;
+  return typeof field === "string" ? field : `Change ${index + 1}`;
+};
 
 const navItems = [
   { id: "overview", label: "Overview", icon: Grid2X2 },
@@ -242,6 +338,8 @@ export function AdminDashboard() {
   const [reports, setReports] = useState<ReportRow[]>([]);
   const [emergencies, setEmergencies] = useState<EmergencyRow[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditRow[]>([]);
+  const [walkWithMeCount, setWalkWithMeCount] = useState(0);
+  const [walkWithMeAvailable, setWalkWithMeAvailable] = useState(true);
   const [activeSection, setActiveSection] = useState<AdminSection>("overview");
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -287,6 +385,7 @@ export function AdminDashboard() {
       setReports([]);
       setEmergencies([]);
       setAuditLogs([]);
+      setWalkWithMeCount(0);
       setLoading(false);
       return;
     }
@@ -324,7 +423,7 @@ export function AdminDashboard() {
       role: profile?.role,
       approvalStatus: profile?.approvalStatus,
     });
-    const [usersResult, wardsResult, reportsResult, emergencyResult, auditResult] =
+    const [usersResult, wardsResult, reportsResult, emergencyResult, auditResult, walkWithMeResult] =
       await Promise.all([
         supabase
           .from("users")
@@ -344,6 +443,7 @@ export function AdminDashboard() {
           .select("*")
           .order("created_at", { ascending: false })
           .limit(50),
+        supabase.from("walk_requests").select("id", { count: "exact", head: true }),
       ]);
 
     const tableErrors = [
@@ -383,6 +483,14 @@ export function AdminDashboard() {
     setReports((reportsResult.data || []) as ReportRow[]);
     setEmergencies((emergencyResult.data || []) as EmergencyRow[]);
     setAuditLogs((auditResult.data || []) as AuditRow[]);
+    if (walkWithMeResult.error) {
+      setWalkWithMeCount(0);
+      setWalkWithMeAvailable(false);
+      console.warn("[AdminDashboard] WalkWithMe stats unavailable", walkWithMeResult.error.message);
+    } else {
+      setWalkWithMeCount(walkWithMeResult.count || 0);
+      setWalkWithMeAvailable(true);
+    }
     setLoading(false);
   }, []);
 
@@ -456,8 +564,9 @@ export function AdminDashboard() {
           ...emergencies.map((item) => item.ward_id),
         ].filter(Boolean),
       ).size,
+      walkWithMeTotal: walkWithMeCount,
     };
-  }, [emergencies, reports, users]);
+  }, [emergencies, reports, users, walkWithMeCount]);
 
   const roleOptions = Array.from(
     new Set(users.map((user) => user.role).filter(Boolean)),
@@ -532,7 +641,7 @@ export function AdminDashboard() {
   const filteredAuditLogs = auditLogs.filter((log) => {
     const fields = getAuditFields(log).map(humanizeAuditField).join(" ");
     const haystack =
-      `${getAuditSummary(log)} ${log.operation || ""} ${getAuditResource(log)} ${getAuditActor(log)} ${getAuditRecordLabel(log) || ""} ${fields}`.toLowerCase();
+      `${getAuditSummary(log)} ${log.operation || ""} ${getAuditResource(log)} ${getAuditActor(log, users)} ${getAuditActorEmail(log, users)} ${getAuditRecordLabel(log, { users, reports, emergencies })} ${fields}`.toLowerCase();
     return (
       haystack.includes(query.toLowerCase()) &&
       (statusFilter === "all" ||
@@ -1306,17 +1415,36 @@ export function AdminDashboard() {
                 <div className="min-w-0 flex-1">
                   <p className="font-bold text-zinc-950">{getAuditSummary(log)}</p>
                   <p className="text-sm text-zinc-500">
-                    {getAuditActor(log)} · {formatDate(log.created_at)}
+                    {getAuditActor(log, users)} · {formatDate(log.created_at)}
                   </p>
-                  {getAuditRecordLabel(log) ? (
-                    <p className="mt-1 text-sm text-zinc-700">{getAuditRecordLabel(log)}</p>
-                  ) : null}
+                  <p className="text-sm text-zinc-600">{getAuditActorEmail(log, users)}</p>
+                  <p className="mt-1 text-sm text-zinc-700">
+                    Record: {getAuditRecordLabel(log, { users, reports, emergencies })}
+                    {log.record_id ? <span className="ml-2 font-mono text-xs text-zinc-500">ID {log.record_id}</span> : null}
+                  </p>
                   {getAuditFields(log).length > 0 ? (
                     <p className="mt-1 text-xs text-zinc-500">
                       Changed: {getAuditFields(log).slice(0, 4).map(humanizeAuditField).join(", ")}
                       {getAuditFields(log).length > 4 ? ` +${getAuditFields(log).length - 4} more` : ""}
                     </p>
-                  ) : null}</div>
+                  ) : null}
+                  {log.privacy_version ? (
+                    <p className="mt-1 text-xs text-amber-800">Historical values were HMAC protected and cannot be restored.</p>
+                  ) : null}
+                  {log.record_id ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="mt-3"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setSelectedAuditLog(log);
+                      }}
+                    >
+                      View record activity
+                    </Button>
+                  ) : null}
+                </div>
               </div>
             ))}
           </div>
@@ -1530,7 +1658,7 @@ export function AdminDashboard() {
     return (
       <div className="grid gap-4 xl:grid-cols-[1fr_380px]">
         <div className="space-y-4">
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
             <StatCard
               label="Total Users"
               value={formatNumber(users.length)}
@@ -1562,6 +1690,13 @@ export function AdminDashboard() {
               icon={MapPin}
               tone="bg-emerald-50 text-emerald-700"
               onClick={() => setActiveSection("users")}
+            />
+            <StatCard
+              label="WalkWithMe Sessions"
+              value={walkWithMeAvailable ? formatNumber(metrics.walkWithMeTotal) : "—"}
+              detail={walkWithMeAvailable ? "Total records from walk requests" : "Database table unavailable"}
+              icon={Users}
+              tone="bg-violet-50 text-violet-700"
             />
           </div>
           <Panel title="Operational Activity">
@@ -1927,19 +2062,45 @@ export function AdminDashboard() {
                 }
               >
                 <div className="space-y-4">
-                  <p className="text-sm text-zinc-600">
-                    Personal values are protected in audit history. The event, resource, time, and changed field names remain available here.
-                  </p>
                   <div className="grid gap-3 rounded-lg border border-zinc-200 p-4 sm:grid-cols-2">
                     <p><strong>Action:</strong> {getAuditAction(selectedAuditLog.operation)}</p>
                     <p><strong>Resource:</strong> {getAuditResource(selectedAuditLog)}</p>
-                    <p><strong>Actor:</strong> {getAuditActor(selectedAuditLog)}</p>
+                    <p><strong>Actor:</strong> {getAuditActor(selectedAuditLog, users)}</p>
+                    <p><strong>Email:</strong> {getAuditActorEmail(selectedAuditLog, users)}</p>
                     <p><strong>When:</strong> {formatDate(selectedAuditLog.created_at)}</p>
-                    <p className="sm:col-span-2"><strong>Record:</strong> {getAuditRecordLabel(selectedAuditLog) || "Not available"}</p>
+                    <p className="sm:col-span-2"><strong>Record:</strong> {getAuditRecordLabel(selectedAuditLog, { users, reports, emergencies })}</p>
+                    <p className="sm:col-span-2 break-all font-mono text-xs"><strong>Record ID:</strong> {selectedAuditLog.record_id || "Not available"}</p>
                   </div>
                   <div>
-                    <h3 className="mb-2 text-sm font-semibold text-zinc-900">Changed fields</h3>
-                    {getAuditFields(selectedAuditLog).length ? (
+                    <h3 className="mb-2 text-sm font-semibold text-zinc-900">Changes</h3>
+                    {getAuditChanges(selectedAuditLog).length ? (
+                      <div className="space-y-2">
+                        {getAuditChanges(selectedAuditLog).map((change, index) => {
+                          const field = getAuditChangeField(change, index);
+                          const before = getAuditChangeValues(change, "old");
+                          const after = getAuditChangeValues(change, "new");
+                          return (
+                            <div key={`${field}-${index}`} className="rounded-md border border-zinc-200 p-3">
+                              <p className="mb-2 text-sm font-semibold text-zinc-800">{humanizeAuditField(field)}</p>
+                              <div className="grid gap-2 sm:grid-cols-2">
+                                {before !== undefined ? (
+                                  <div className="min-w-0 rounded bg-red-50 p-2">
+                                    <p className="text-xs font-semibold uppercase text-red-700">Before</p>
+                                    <pre className="mt-1 overflow-auto whitespace-pre-wrap break-words text-xs text-zinc-800">{formatAuditValue(before)}</pre>
+                                  </div>
+                                ) : null}
+                                {after !== undefined ? (
+                                  <div className="min-w-0 rounded bg-emerald-50 p-2">
+                                    <p className="text-xs font-semibold uppercase text-emerald-700">After</p>
+                                    <pre className="mt-1 overflow-auto whitespace-pre-wrap break-words text-xs text-zinc-800">{formatAuditValue(after)}</pre>
+                                  </div>
+                                ) : null}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : getAuditFields(selectedAuditLog).length ? (
                       <ul className="grid gap-2 sm:grid-cols-2">
                         {getAuditFields(selectedAuditLog).map((field) => (
                           <li key={field} className="rounded-md bg-zinc-50 px-3 py-2 text-sm text-zinc-700">
@@ -1948,8 +2109,17 @@ export function AdminDashboard() {
                         ))}
                       </ul>
                     ) : (
-                      <p className="text-sm text-zinc-500">No field-level details are available for this event.</p>
+                      <p className="text-sm text-zinc-500">This event has no field-level change details.</p>
                     )}
+                  </div>
+                  <div>
+                    <h3 className="mb-2 text-sm font-semibold text-zinc-900">Raw change details</h3>
+                    {selectedAuditLog.privacy_version ? (
+                      <p className="mb-2 text-xs text-amber-800">This historical event was stored with HMAC protection. Its original before/after values cannot be recovered.</p>
+                    ) : null}
+                    <pre className="max-h-80 overflow-auto rounded-lg bg-zinc-950 p-3 text-xs text-zinc-100">{formatAuditValue(selectedAuditLog.change_details)}</pre>
+                    <h3 className="mb-2 mt-4 text-sm font-semibold text-zinc-900">Record snapshot</h3>
+                    <pre className="max-h-80 overflow-auto rounded-lg bg-zinc-950 p-3 text-xs text-zinc-100">{formatAuditValue(selectedAuditLog.operation === "DELETE" ? selectedAuditLog.old_record : selectedAuditLog.new_record)}</pre>
                   </div>
                 </div>
               </Panel>
